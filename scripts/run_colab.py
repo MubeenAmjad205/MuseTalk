@@ -226,7 +226,8 @@ def install_dependencies(start, end):
         shutil.rmtree(VENV)  # left over from an interrupted run
     pip = f"uv pip install --python {PY}"
     sub_steps = [
-        ("Creating Python 3.10 environment", 5, [f"{sys.executable} -m pip install -q uv", f"uv venv --python 3.10 {VENV}"]),
+        ("Creating Python 3.10 environment", 5,
+         [f"{sys.executable} -m pip install -q uv", f"uv venv --clear --python 3.10 {VENV}"]),
         ("Installing PyTorch 2.0.1 (CUDA 11.8)", 35,
          [f"{pip} torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url {TORCH_INDEX}"]),
         ("Installing MuseTalk requirements", 35, [f"{pip} -r requirements.txt"]),
@@ -409,6 +410,7 @@ def launch():
 
 def main():
     os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    open(LOG, "w").close()  # start each run with a fresh log so errors aren't mixed with old ones
     print("\n🎬 MuseTalk Studio setup\n", flush=True)
     check_gpu()
     if os.path.exists(SETUP_DONE):
