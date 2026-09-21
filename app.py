@@ -474,78 +474,120 @@ def check_video(video):
 
 
 
-css = """#input_img {max-width: 1024px !important} #output_vid {max-width: 1024px; max-height: 576px}"""
+def generate(video, audio, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width,
+             progress=gr.Progress(track_tqdm=True)):
+    """Validate inputs, run inference, and report status for the UI."""
+    if not video:
+        raise gr.Error("Please upload a face video first.")
+    if not audio:
+        raise gr.Error("Please add the audio you want the face to speak.")
+    start = time.time()
+    output_path, bbox_range = inference(audio, video, bbox_shift, extra_margin, parsing_mode,
+                                        left_cheek_width, right_cheek_width, progress=progress)
+    status = f"✅ **Done in {time.time() - start:.0f}s.** Use the ⬇ button on the video to download it."
+    return output_path, status, bbox_range
 
-with gr.Blocks(css=css) as demo:
-    gr.Markdown(
-        """<div align='center'> <h1>MuseTalk: Real-Time High-Fidelity Video Dubbing via Spatio-Temporal Sampling</h1> \
-                    <h2 style='font-weight: 450; font-size: 1rem; margin: 0rem'>\
-                    </br>\
-                    Yue Zhang <sup>*</sup>,\
-                    Zhizhou Zhong <sup>*</sup>,\
-                    Minhao Liu<sup>*</sup>,\
-                    Zhaokang Chen,\
-                    Bin Wu<sup>†</sup>,\
-                    Yubin Zeng,\
-                    Chao Zhang,\
-                    Yingjie He,\
-                    Junxin Huang,\
-                    Wenjiang Zhou <br>\
-                    (<sup>*</sup>Equal Contribution, <sup>†</sup>Corresponding Author, benbinwu@tencent.com)\
-                    Lyra Lab, Tencent Music Entertainment\
-                </h2> \
-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Github Repo]</a>\
-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Huggingface]</a>\
-                <a style='font-size:18px;color: #000000' href='https://arxiv.org/abs/2410.10122'> [Technical report] </a>"""
+
+def preview(video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width):
+    if not video:
+        raise gr.Error("Please upload a face video first.")
+    return debug_inpainting(video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width)
+
+
+theme = gr.themes.Soft(
+    primary_hue="cyan",
+    secondary_hue="indigo",
+    neutral_hue="slate",
+    radius_size="lg",
+    font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
+).set(
+    button_primary_background_fill="linear-gradient(90deg, #06b6d4, #6366f1)",
+    button_primary_background_fill_hover="linear-gradient(90deg, #0891b2, #4f46e5)",
+    button_primary_text_color="white",
+    block_title_text_weight="600",
+)
+
+css = """
+.gradio-container {max-width: 1180px !important; margin: auto;}
+#hero {text-align: center; padding: 28px 16px 8px;}
+#hero h1 {font-size: 2.3rem; font-weight: 800; margin: 0;
+          background: linear-gradient(90deg, #06b6d4, #6366f1); -webkit-background-clip: text; background-clip: text; color: transparent;}
+#hero p {margin: 6px 0 16px; opacity: .75; font-size: 1.05rem;}
+.steps {display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;}
+.steps span {padding: 6px 14px; border-radius: 999px; font-size: .9rem;
+             border: 1px solid var(--border-color-primary); background: var(--background-fill-secondary);}
+.card {border: 1px solid var(--border-color-primary) !important; border-radius: 16px !important; padding: 16px !important;}
+#generate {font-size: 1.1rem; min-height: 52px;}
+#output_vid {max-height: 560px;}
+#footer {text-align: center; opacity: .6; font-size: .85rem; padding: 12px;}
+"""
+
+with gr.Blocks(theme=theme, css=css, title="MuseTalk Studio") as demo:
+    gr.HTML("""
+    <div id="hero">
+      <h1>🎬 MuseTalk Studio</h1>
+      <p>Make any face video speak any audio: real-time, high-fidelity lip-sync.</p>
+      <div class="steps"><span>① Upload a face video</span><span>② Add the audio</span><span>③ Generate</span></div>
+    </div>""")
+
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=5, elem_classes="card"):
+            gr.Markdown("### 📥 Inputs")
+            video = gr.Video(label="Face video", sources=["upload"], height=300)
+            audio = gr.Audio(label="Audio to speak", type="filepath", sources=["upload", "microphone"])
+            btn = gr.Button("✨ Generate lip-sync", variant="primary", elem_id="generate")
+
+            with gr.Accordion("🎛️ Fine-tune (optional)", open=False):
+                gr.Markdown("Defaults work for most videos. If the mouth looks off, tweak these and click **Preview** to check the first frame.")
+                extra_margin = gr.Slider(label="Jaw movement range (extra margin)", minimum=0, maximum=40, value=10, step=1)
+                parsing_mode = gr.Radio(label="Blend mode", choices=["jaw", "raw"], value="jaw",
+                                        info="'jaw' blends the lower face naturally; 'raw' pastes the whole generated crop.")
+                with gr.Row():
+                    left_cheek_width = gr.Slider(label="Left cheek width", minimum=20, maximum=160, value=90, step=5)
+                    right_cheek_width = gr.Slider(label="Right cheek width", minimum=20, maximum=160, value=90, step=5)
+                bbox_shift = gr.Number(label="Face box shift (px)", value=0)
+                debug_btn = gr.Button("🔍 Preview first frame", variant="secondary")
+                debug_image = gr.Image(label="Preview", height=260)
+                debug_info = gr.Textbox(label="Preview details", lines=4)
+                bbox_shift_scale = gr.Textbox(label="Detected face-box range", interactive=False)
+
+        with gr.Column(scale=6, elem_classes="card"):
+            gr.Markdown("### 🎞️ Result")
+            out1 = gr.Video(label="Lip-synced video", elem_id="output_vid", interactive=False, show_download_button=True)
+            status = gr.Markdown("Your video will appear here. Generation usually takes 1–3 minutes on a T4 GPU.")
+            gr.Markdown("""
+**Tips for best results**
+- Use a clear, front-facing video with one visible face and good lighting.
+- Clean speech works best; background music can reduce accuracy.
+- The output is as long as the audio; the video loops if the audio is longer.
+""")
+
+    gr.Examples(
+        label="⚡ Try an example",
+        examples=[["data/video/yongen.mp4", "data/audio/yongen.wav"],
+                  ["data/video/yongen.mp4", "data/audio/eng.wav"],
+                  ["data/video/sun.mp4", "data/audio/sun.wav"]],
+        inputs=[video, audio],
     )
 
-    with gr.Row():
-        with gr.Column():
-            audio = gr.Audio(label="Drving Audio",type="filepath")
-            video = gr.Video(label="Reference Video",sources=['upload'])
-            bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
-            extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=40, value=10, step=1)
-            parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
-            left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=20, maximum=160, value=90, step=5)
-            right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=20, maximum=160, value=90, step=5)
-            bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
+    gr.HTML("""<div id="footer">Powered by <a href="https://github.com/TMElyralab/MuseTalk" target="_blank">MuseTalk</a>
+    (Lyra Lab, Tencent Music Entertainment) · Only use videos and voices you have permission to use.</div>""")
 
-            with gr.Row():
-                debug_btn = gr.Button("1. Test Inpainting ")
-                btn = gr.Button("2. Generate")
-        with gr.Column():
-            debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
-            debug_info = gr.Textbox(label="Parameter Information", lines=5)
-            out1 = gr.Video()
-    
-    video.change(
-        fn=check_video, inputs=[video], outputs=[video]
-    )
+    video.change(fn=check_video, inputs=[video], outputs=[video])
     btn.click(
-        fn=inference,
-        inputs=[
-            audio,
-            video,
-            bbox_shift,
-            extra_margin,
-            parsing_mode,
-            left_cheek_width,
-            right_cheek_width
-        ],
-        outputs=[out1,bbox_shift_scale]
+        fn=lambda: "⏳ **Generating…** extracting frames, detecting the face, then syncing the lips.",
+        outputs=status,
+    ).then(
+        fn=generate,
+        inputs=[video, audio, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width],
+        outputs=[out1, status, bbox_shift_scale],
     )
     debug_btn.click(
-        fn=debug_inpainting,
-        inputs=[
-            video,
-            bbox_shift,
-            extra_margin,
-            parsing_mode,
-            left_cheek_width,
-            right_cheek_width
-        ],
-        outputs=[debug_image, debug_info]
+        fn=preview,
+        inputs=[video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width],
+        outputs=[debug_image, debug_info],
     )
+
 
 # Check ffmpeg and add to PATH
 if not fast_check_ffmpeg():
