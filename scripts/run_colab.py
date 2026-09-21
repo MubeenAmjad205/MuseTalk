@@ -25,12 +25,25 @@ os.environ["MPLBACKEND"] = "Agg"
 VENV = "/content/musetalk-venv"
 PY = f"{VENV}/bin/python"
 SETUP_DONE = f"{VENV}/.setup_done"
+# Bump when the install steps change, so existing Colab environments get rebuilt.
+SETUP_VERSION = "3"
 LOG = "/content/musetalk_setup.log"
 
 MMCV_INDEX = "https://download.openmmlab.com/mmcv/dist/cu118/torch2.0/index.html"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu118"
 # Keep numpy at MuseTalk's pinned version while adding the OpenMMLab packages.
 NUMPY_PIN = '"numpy==1.23.5"'
+# Every third-party import the app makes at startup; checked right after installing.
+IMPORT_CHECK = "; ".join([
+    "import torch",
+    "assert torch.cuda.is_available(), 'CUDA not available'",
+    "import pkg_resources, mmcv, mmdet, mmengine",
+    "from mmpose.apis import inference_topdown, init_model",
+    "from mmpose.structures import merge_data_samples",
+    "from moviepy.editor import VideoFileClip",
+    "from transformers import WhisperModel",
+    "import diffusers, gradio, omegaconf, gdown, imageio, ffmpeg, proglog, cv2, librosa, soundfile",
+])
 
 # Weights needed by the app. MuseTalk 1.0 (models/musetalk) is downloaded by the app on first use.
 HF_WEIGHTS = [
@@ -224,14 +237,16 @@ def check_gpu():
 
 def install_dependencies(start, end):
     """Install everything, splitting start..end between the sub-steps by their typical duration."""
-    if os.path.exists(SETUP_DONE):
+    if setup_is_current():
         return
     if os.path.exists(VENV):
         shutil.rmtree(VENV)  # left over from an interrupted run
     pip = f"uv pip install --python {PY}"
     sub_steps = [
+        # setuptools<70 still ships pkg_resources, which mmengine imports.
         ("Creating Python 3.10 environment", 5,
-         [f"{sys.executable} -m pip install -q uv", f"uv venv --clear --python 3.10 {VENV}"]),
+         [f"{sys.executable} -m pip install -q uv", f"uv venv --clear --python 3.10 {VENV}",
+          f'uv pip install --python {PY} "setuptools<70" wheel']),
         ("Installing PyTorch 2.0.1 (CUDA 11.8)", 35,
          [f"{pip} torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url {TORCH_INDEX}"]),
         ("Installing MuseTalk requirements", 35, [f"{pip} -r requirements.txt"]),
@@ -243,8 +258,7 @@ def install_dependencies(start, end):
             f'{pip} --no-deps "mmpose==1.1.0"',
             f"{pip} json_tricks munkres xtcocotools {NUMPY_PIN}",
         ]),
-        ("Verifying installation", 5,
-         [f'{PY} -c "import torch, mmcv, mmdet, mmpose; assert torch.cuda.is_available(), \'CUDA not available\'"']),
+        ("Verifying installation", 5, [f'{PY} -c "{IMPORT_CHECK}"']),
     ]
     total = sum(weight for _, weight, _ in sub_steps)
     pos = start
@@ -252,7 +266,16 @@ def install_dependencies(start, end):
         span = (end - start) * weight / total
         step(label, pos, pos + span, run_steps(commands))
         pos += span
-    open(SETUP_DONE, "w").close()
+    with open(SETUP_DONE, "w") as f:
+        f.write(SETUP_VERSION)
+
+
+def setup_is_current():
+    try:
+        with open(SETUP_DONE) as f:
+            return f.read().strip() == SETUP_VERSION
+    except OSError:
+        return False
 
 
 def link_drive_cache():
@@ -417,7 +440,7 @@ def main():
     open(LOG, "w").close()  # start each run with a fresh log so errors aren't mixed with old ones
     print("\n🎬 MuseTalk Studio setup\n", flush=True)
     check_gpu()
-    if os.path.exists(SETUP_DONE):
+    if setup_is_current():
         print("  ✅ Dependencies already installed", flush=True)
     else:
         install_dependencies(2, 50)
