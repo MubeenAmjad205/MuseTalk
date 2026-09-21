@@ -18,6 +18,10 @@ import threading
 import time
 from collections import deque
 
+# Colab points MPLBACKEND at its notebook backend, which doesn't exist inside our venv;
+# use the headless backend for everything this script starts.
+os.environ["MPLBACKEND"] = "Agg"
+
 VENV = "/content/musetalk-venv"
 PY = f"{VENV}/bin/python"
 SETUP_DONE = f"{VENV}/.setup_done"
