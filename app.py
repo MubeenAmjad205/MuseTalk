@@ -34,7 +34,7 @@ CheckpointsDir = os.path.join(ProjectDir, "models")
 
 @torch.no_grad()
 def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-                    left_cheek_width=90, right_cheek_width=90):
+                    left_cheek_width=90, right_cheek_width=90, version="v15", progress=gr.Progress()):
     """Debug inpainting parameters, only process the first frame"""
     # Set default parameters
     args_dict = {
@@ -45,7 +45,7 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
         "use_saved_coord": False,
         "audio_padding_length_left": 2,
         "audio_padding_length_right": 2,
-        "version": "v15",
+        "version": version,
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
@@ -56,7 +56,14 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
     # Create debug directory
     os.makedirs(args.result_dir, exist_ok=True)
     
+    stage_list = []
+    if version not in loaded_unets:
+        stage_list.append(("model", f"Loading {MODEL_VERSIONS[version][0]} (first use only)", 20))
+    stage_list += [("read", "Reading first frame", 1), ("face", "Detecting face", 4), ("preview", "Generating preview", 3)]
+    stages = StageProgress(progress, stage_list)
+    model_unet = get_unet(version, stages, "model")
     # Read first frame
+    stages.update("read")
     if get_file_type(video_path) == "video":
         reader = imageio.get_reader(video_path)
         first_frame = reader.get_data(0)
@@ -70,6 +77,7 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
     cv2.imwrite(debug_frame_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
     
     # Get face coordinates
+    stages.update("face")
     coord_list, frame_list = get_landmark_and_bbox([debug_frame_path], bbox_shift)
     bbox = coord_list[0]
     frame = frame_list[0]
@@ -78,15 +86,20 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
         return None, "No face detected, please adjust bbox_shift parameter"
     
     # Initialize face parser
-    fp = FaceParsing(
-        left_cheek_width=args.left_cheek_width,
-        right_cheek_width=args.right_cheek_width
-    )
+    stages.update("preview")
+    if version == "v15":
+        fp = FaceParsing(
+            left_cheek_width=args.left_cheek_width,
+            right_cheek_width=args.right_cheek_width
+        )
+    else:
+        fp = FaceParsing()
     
     # Process first frame
     x1, y1, x2, y2 = bbox
-    y2 = y2 + args.extra_margin
-    y2 = min(y2, frame.shape[0])
+    if version == "v15":
+        y2 = y2 + args.extra_margin
+        y2 = min(y2, frame.shape[0])
     crop_frame = frame[y1:y2, x1:x2]
     crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
     
@@ -99,20 +112,24 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
     latents = latents.to(dtype=weight_dtype)
     
     # Generate prediction results
-    pred_latents = unet.model(latents, timesteps, encoder_hidden_states=audio_feature).sample
+    pred_latents = model_unet.model(latents, timesteps, encoder_hidden_states=audio_feature).sample
     recon = vae.decode_latents(pred_latents)
     
     # Inpaint back to original image
     res_frame = recon[0]
     res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
-    combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+    if version == "v15":
+        combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+    else:
+        combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], fp=fp)
     
     # Save results (no need to convert color space again since get_image already returns RGB format)
     debug_result_path = os.path.join(args.result_dir, "debug_result.png")
     cv2.imwrite(debug_result_path, combine_frame)
     
     # Create information text
-    info_text = f"Parameter information:\n" + \
+    info_text = f"Model: {MODEL_VERSIONS[version][0]}\n" + \
+                f"Parameter information:\n" + \
                 f"bbox_shift: {bbox_shift}\n" + \
                 f"extra_margin: {extra_margin}\n" + \
                 f"parsing_mode: {parsing_mode}\n" + \
@@ -169,7 +186,144 @@ from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
+from musetalk.models.unet import UNet
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, get_bbox_range
+
+
+import musetalk.utils.preprocessing as preprocessing_module
+from contextlib import contextmanager
+import proglog
+
+
+class StageProgress:
+    """Maps the progress of several named stages onto one overall 0-100% Gradio progress bar."""
+
+    def __init__(self, progress, stages):
+        """`stages` is a list of (key, label, weight); weights set each stage's share of the bar."""
+        self.progress = progress
+        self.index = {key: i for i, (key, _, _) in enumerate(stages)}
+        self.names = [label for _, label, _ in stages]
+        total_weight = sum(weight for _, _, weight in stages)
+        self.starts, self.spans, acc = [], [], 0
+        for _, _, weight in stages:
+            self.starts.append(acc / total_weight)
+            self.spans.append(weight / total_weight)
+            acc += weight
+        self._last_update = 0.0
+
+    def update(self, key, frac=0.0, detail="", force=True):
+        idx = self.index[key]
+        now = time.time()
+        if not force and now - self._last_update < 0.25:
+            return
+        self._last_update = now
+        overall = self.starts[idx] + self.spans[idx] * min(max(frac, 0.0), 1.0)
+        desc = f"Step {idx + 1}/{len(self.names)} · {self.names[idx]}" + (f" · {detail}" if detail else "")
+        self.progress(overall, desc=desc)
+
+    def track(self, iterable, key, total=None, lo=0.0, hi=1.0):
+        """Yield from `iterable`, moving stage `key` from `lo` to `hi` of its span."""
+        if total is None:
+            try:
+                total = len(iterable)
+            except TypeError:
+                total = None
+        self.update(key, lo)
+        for i, item in enumerate(iterable, 1):
+            yield item
+            if total:
+                self.update(key, lo + (hi - lo) * min(i / total, 1.0), f"{min(i, total)}/{total}", force=False)
+        self.update(key, hi)
+
+    @contextmanager
+    def patch_tqdm(self, module, key, weights=(1,)):
+        """Route a library module's successive tqdm loops into stage `key`, giving loop k `weights[k]` of the stage."""
+        original = module.tqdm
+        bounds = [sum(weights[:k]) / sum(weights) for k in range(len(weights) + 1)]
+        calls = [0]
+
+        def staged_tqdm(iterable, *args, **kwargs):
+            k = min(calls[0], len(weights) - 1)
+            calls[0] += 1
+            return self.track(iterable, key, total=kwargs.get("total"), lo=bounds[k], hi=bounds[k + 1])
+
+        module.tqdm = staged_tqdm
+        try:
+            yield
+        finally:
+            module.tqdm = original
+
+
+class StageVideoLogger(proglog.ProgressBarLogger):
+    """Reports moviepy's video-encoding progress to a StageProgress stage."""
+
+    def __init__(self, stages, key, lo=0.0, hi=1.0):
+        super().__init__()
+        self.stages, self.key, self.lo, self.hi = stages, key, lo, hi
+
+    def bars_callback(self, bar, attr, value, old_value=None):
+        total = self.bars[bar].get("total")
+        if bar == "t" and attr == "index" and total:
+            frac = min(value / total, 1.0)
+            self.stages.update(self.key, self.lo + (self.hi - self.lo) * frac, f"encoding {int(100 * frac)}%", force=False)
+
+
+MODEL_VERSIONS = {
+    # version: (label, folder under models/, weights file)
+    "v15": ("MuseTalk 1.5", "musetalkV15", "unet.pth"),
+    "v1": ("MuseTalk 1.0", "musetalk", "pytorch_model.bin"),
+}
+loaded_unets = {}
+
+
+def download_hf_file(repo_id, filename, dest, stages=None, key=None, span=1.0):
+    """Stream a file from the Hugging Face Hub, reporting real byte progress to a stage."""
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    headers = {"Authorization": f"Bearer {os.environ['HF_TOKEN']}"} if os.environ.get("HF_TOKEN") else {}
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0)) or None
+        done = 0
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                if stages and total:
+                    stages.update(key, span * done / total,
+                                  f"downloading {done / 1e9:.2f} / {total / 1e9:.2f} GB", force=False)
+    os.replace(tmp, dest)
+
+
+def get_unet(version, stages=None, key=None):
+    """Return the UNet for `version`, downloading and loading it on first use."""
+    if version in loaded_unets:
+        return loaded_unets[version]
+    _, folder, weights_file = MODEL_VERSIONS[version]
+    config_path = os.path.join(CheckpointsDir, folder, "musetalk.json")
+    weights_path = os.path.join(CheckpointsDir, folder, weights_file)
+    if not os.path.exists(config_path):
+        download_hf_file("TMElyralab/MuseTalk", f"{folder}/musetalk.json", config_path)
+    if not os.path.exists(weights_path):
+        download_hf_file("TMElyralab/MuseTalk", f"{folder}/{weights_file}", weights_path, stages, key, span=0.85)
+    if stages:
+        stages.update(key, 0.9, "loading onto GPU")
+    model = UNet(unet_config=config_path, model_path=weights_path, device=device)
+    if weight_dtype == torch.float16:
+        model.model = model.model.half()
+    model.model = model.model.to(device)
+    loaded_unets[version] = model
+    if stages:
+        stages.update(key, 1.0)
+    return model
+
+
+def estimate_frame_count(video_path):
+    cap = cv2.VideoCapture(video_path)
+    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return count or None
 
 
 def fast_check_ffmpeg():
@@ -182,7 +336,22 @@ def fast_check_ffmpeg():
 
 @torch.no_grad()
 def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-              left_cheek_width=90, right_cheek_width=90, progress=gr.Progress(track_tqdm=True)):
+              left_cheek_width=90, right_cheek_width=90, version="v15", progress=gr.Progress()):
+    stage_list = []
+    if version not in loaded_unets:
+        stage_list.append(("model", f"Loading {MODEL_VERSIONS[version][0]} (first use only)", 40))
+    stage_list += [
+        ("frames", "Extracting video frames", 6),
+        ("audio", "Analyzing audio", 4),
+        ("landmarks", "Detecting face landmarks", 25),
+        ("range", "Measuring face-box range", 15),
+        ("encode", "Encoding face frames", 8),
+        ("generate", "Generating lip movements", 22),
+        ("blend", "Blending onto original video", 12),
+        ("render", "Rendering final video", 8),
+    ]
+    stages = StageProgress(progress, stage_list)
+    model_unet = get_unet(version, stages, "model")
     # Set default parameters, aligned with inference.py
     args_dict = {
         "result_dir": './results/output', 
@@ -192,7 +361,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         "use_saved_coord": False,
         "audio_padding_length_left": 2,
         "audio_padding_length_right": 2,
-        "version": "v15",  # Fixed use v15 version
+        "version": version,
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
@@ -230,7 +399,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         reader = imageio.get_reader(video_path)
 
         # Save images
-        for i, im in enumerate(reader):
+        for i, im in enumerate(stages.track(reader, "frames", total=estimate_frame_count(video_path))):
             imageio.imwrite(f"{save_dir_full}/{i:08d}.png", im)
         input_img_list = sorted(glob.glob(os.path.join(save_dir_full, '*.[jpJP][pnPN]*[gG]')))
         fps = get_video_fps(video_path)
@@ -241,6 +410,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         
     ############################################## extract audio feature ##############################################
     # Extract audio features
+    stages.update("audio", 0.1, "reading audio")
     whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
     whisper_chunks = audio_processor.get_whisper_chunk(
         whisper_input_features, 
@@ -252,34 +422,42 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         audio_padding_length_left=args.audio_padding_length_left,
         audio_padding_length_right=args.audio_padding_length_right,
     )
+    stages.update("audio", 1.0)
         
     ############################################## preprocess input image  ##############################################
     if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
         print("using extracted coordinates")
         with open(crop_coord_save_path,'rb') as f:
             coord_list = pickle.load(f)
-        frame_list = read_imgs(input_img_list)
+        with stages.patch_tqdm(preprocessing_module, "landmarks"):
+            frame_list = read_imgs(input_img_list)
     else:
         print("extracting landmarks...time consuming")
-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+        with stages.patch_tqdm(preprocessing_module, "landmarks", weights=(1, 9)):
+            coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
         with open(crop_coord_save_path, 'wb') as f:
             pickle.dump(coord_list, f)
-    bbox_shift_text = get_bbox_range(input_img_list, bbox_shift)
+    with stages.patch_tqdm(preprocessing_module, "range", weights=(1, 9)):
+        bbox_shift_text = get_bbox_range(input_img_list, bbox_shift)
     
-    # Initialize face parser
-    fp = FaceParsing(
-        left_cheek_width=args.left_cheek_width,
-        right_cheek_width=args.right_cheek_width
-    )
+    # Initialize face parser (v1.0 uses the default cheek widths)
+    if version == "v15":
+        fp = FaceParsing(
+            left_cheek_width=args.left_cheek_width,
+            right_cheek_width=args.right_cheek_width
+        )
+    else:
+        fp = FaceParsing()
     
     i = 0
     input_latent_list = []
-    for bbox, frame in zip(coord_list, frame_list):
+    for bbox, frame in stages.track(list(zip(coord_list, frame_list)), "encode"):
         if bbox == coord_placeholder:
             continue
         x1, y1, x2, y2 = bbox
-        y2 = y2 + args.extra_margin
-        y2 = min(y2, frame.shape[0])
+        if version == "v15":
+            y2 = y2 + args.extra_margin
+            y2 = min(y2, frame.shape[0])
         crop_frame = frame[y1:y2, x1:x2]
         crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
         latents = vae.get_latents_for_unet(crop_frame)
@@ -302,31 +480,35 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         device=device,
     )
     res_frame_list = []
-    for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/batch_size)))):
+    for i, (whisper_batch,latent_batch) in enumerate(stages.track(gen, "generate", total=int(np.ceil(float(video_num)/batch_size)))):
         audio_feature_batch = pe(whisper_batch)
         # Ensure latent_batch is consistent with model weight type
         latent_batch = latent_batch.to(dtype=weight_dtype)
         
-        pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+        pred_latents = model_unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
         recon = vae.decode_latents(pred_latents)
         for res_frame in recon:
             res_frame_list.append(res_frame)
             
     ############################################## pad to full image ##############################################
     print("pad talking image to original video")
-    for i, res_frame in enumerate(tqdm(res_frame_list)):
+    for i, res_frame in enumerate(stages.track(res_frame_list, "blend")):
         bbox = coord_list_cycle[i%(len(coord_list_cycle))]
         ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
         x1, y1, x2, y2 = bbox
-        y2 = y2 + args.extra_margin
-        y2 = min(y2, frame.shape[0])
+        if version == "v15":
+            y2 = y2 + args.extra_margin
+            y2 = min(y2, frame.shape[0])
         try:
             res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
         except:
             continue
         
-        # Use v15 version blending
-        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        # Merge results with version-specific blending
+        if version == "v15":
+            combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        else:
+            combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
             
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
@@ -344,12 +526,13 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     files = [file for file in os.listdir(result_img_save_path) if is_valid_image(file)]
     files.sort(key=lambda x: int(x.split('.')[0]))
 
-    for file in files:
+    for file in stages.track(files, "render", hi=0.3):
         filename = os.path.join(result_img_save_path, file)
         images.append(imageio.imread(filename))
         
 
     # Save video
+    stages.update("render", 0.35, "writing frames")
     imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
 
     input_video = './temp.mp4'
@@ -378,7 +561,8 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     video_clip = video_clip.set_audio(audio_clip)
 
     # Write the output video
-    video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=25)
+    video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=25,
+                               logger=StageVideoLogger(stages, "render", lo=0.4, hi=1.0))
 
     os.remove("temp.mp4")
     #shutil.rmtree(result_img_save_path)
@@ -420,6 +604,8 @@ pe = pe.to(device)
 vae.vae = vae.vae.to(device)
 unet.model = unet.model.to(device)
 
+loaded_unets["v15"] = unet
+
 timesteps = torch.tensor([0], device=device)
 
 # Initialize audio processor and Whisper model
@@ -429,7 +615,7 @@ whisper = whisper.to(device=device, dtype=weight_dtype).eval()
 whisper.requires_grad_(False)
 
 
-def check_video(video):
+def check_video(video, progress=gr.Progress()):
     if not isinstance(video, str):
         return video # in case of none type
     # Define the output video file name
@@ -452,7 +638,8 @@ def check_video(video):
     fps = reader.get_meta_data()['fps']  # get fps from original video
 
     # conver fps to 25
-    frames = [im for im in reader]
+    stages = StageProgress(progress, [("prepare", "Preparing video (converting to 25 fps)", 1)])
+    frames = [im for im in stages.track(reader, "prepare", total=estimate_frame_count(video), hi=0.6)]
     target_fps = 25
     
     L = len(frames)
@@ -468,14 +655,15 @@ def check_video(video):
         target_frames.append(frames[t_idx])
 
     # save video
+    stages.update("prepare", 0.7, "saving")
     imageio.mimwrite(output_video, target_frames, 'FFMPEG', fps=25, codec='libx264', quality=9, pixelformat='yuv420p')
     return output_video
 
 
 
 
-def generate(video, audio, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width,
-             progress=gr.Progress(track_tqdm=True)):
+def generate(video, audio, version, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width,
+             progress=gr.Progress()):
     """Validate inputs, run inference, and report status for the UI."""
     if not video:
         raise gr.Error("Please upload a face video first.")
@@ -483,15 +671,24 @@ def generate(video, audio, bbox_shift, extra_margin, parsing_mode, left_cheek_wi
         raise gr.Error("Please add the audio you want the face to speak.")
     start = time.time()
     output_path, bbox_range = inference(audio, video, bbox_shift, extra_margin, parsing_mode,
-                                        left_cheek_width, right_cheek_width, progress=progress)
-    status = f"✅ **Done in {time.time() - start:.0f}s.** Use the ⬇ button on the video to download it."
+                                        left_cheek_width, right_cheek_width, version=version, progress=progress)
+    status = (f"✅ **Done in {time.time() - start:.0f}s** with {MODEL_VERSIONS[version][0]}. "
+              "Use the ⬇ button on the video to download it.")
     return output_path, status, bbox_range
 
 
-def preview(video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width):
+def preview(video, version, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width,
+            progress=gr.Progress()):
     if not video:
         raise gr.Error("Please upload a face video first.")
-    return debug_inpainting(video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width)
+    return debug_inpainting(video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width,
+                            version=version, progress=progress)
+
+
+def on_version_change(version):
+    """Show the v1.5-only blending controls only when v1.5 is selected."""
+    is_v15 = version == "v15"
+    return [gr.update(visible=is_v15)] * 3
 
 
 theme = gr.themes.Soft(
@@ -535,6 +732,12 @@ with gr.Blocks(theme=theme, css=css, title="MuseTalk Studio") as demo:
             gr.Markdown("### 📥 Inputs")
             video = gr.Video(label="Face video", sources=["upload"], height=300)
             audio = gr.Audio(label="Audio to speak", type="filepath", sources=["upload", "microphone"])
+            version = gr.Radio(
+                label="Model",
+                choices=[("MuseTalk 1.5 (recommended)", "v15"), ("MuseTalk 1.0", "v1")],
+                value="v15",
+                info="1.5 gives sharper, better-synced lips. 1.0 downloads ~3.4 GB the first time you use it.",
+            )
             btn = gr.Button("✨ Generate lip-sync", variant="primary", elem_id="generate")
 
             with gr.Accordion("🎛️ Fine-tune (optional)", open=False):
@@ -542,10 +745,11 @@ with gr.Blocks(theme=theme, css=css, title="MuseTalk Studio") as demo:
                 extra_margin = gr.Slider(label="Jaw movement range (extra margin)", minimum=0, maximum=40, value=10, step=1)
                 parsing_mode = gr.Radio(label="Blend mode", choices=["jaw", "raw"], value="jaw",
                                         info="'jaw' blends the lower face naturally; 'raw' pastes the whole generated crop.")
-                with gr.Row():
+                with gr.Row() as cheek_row:
                     left_cheek_width = gr.Slider(label="Left cheek width", minimum=20, maximum=160, value=90, step=5)
                     right_cheek_width = gr.Slider(label="Right cheek width", minimum=20, maximum=160, value=90, step=5)
-                bbox_shift = gr.Number(label="Face box shift (px)", value=0)
+                bbox_shift = gr.Number(label="Face box shift (px)", value=0,
+                                       info="Positive values open the mouth wider, negative values less.")
                 debug_btn = gr.Button("🔍 Preview first frame", variant="secondary")
                 debug_image = gr.Image(label="Preview", height=260)
                 debug_info = gr.Textbox(label="Preview details", lines=4)
@@ -574,17 +778,18 @@ with gr.Blocks(theme=theme, css=css, title="MuseTalk Studio") as demo:
     (Lyra Lab, Tencent Music Entertainment) · Only use videos and voices you have permission to use.</div>""")
 
     video.change(fn=check_video, inputs=[video], outputs=[video])
+    version.change(fn=on_version_change, inputs=[version], outputs=[extra_margin, parsing_mode, cheek_row])
     btn.click(
         fn=lambda: "⏳ **Generating…** extracting frames, detecting the face, then syncing the lips.",
         outputs=status,
     ).then(
         fn=generate,
-        inputs=[video, audio, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width],
+        inputs=[video, audio, version, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width],
         outputs=[out1, status, bbox_shift_scale],
     )
     debug_btn.click(
         fn=preview,
-        inputs=[video, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width],
+        inputs=[video, version, bbox_shift, extra_margin, parsing_mode, left_cheek_width, right_cheek_width],
         outputs=[debug_image, debug_info],
     )
 
